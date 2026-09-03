@@ -1,18 +1,71 @@
+import ast
+
 import akshare as ak
-import pandas as pd
+
+from config import XQ_A_TOKEN
+
+_code_name_cache = None
+
+
+def _normalize_name(name: str) -> str:
+    """去除空白，并把全角字母数字转为半角，用于名称模糊匹配。"""
+    if name is None:
+        return ""
+    s = str(name).replace(" ", "").replace("\u3000", "")
+    s = s.translate(str.maketrans(
+        "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ０１２３４５６７８９",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    ))
+    s = s.translate(str.maketrans(
+        "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+        "abcdefghijklmnopqrstuvwxyz",
+    ))
+    return s
+
+
+def _get_code_name_list():
+    """获取全部 A 股代码与名称（缓存）。"""
+    global _code_name_cache
+    if _code_name_cache is None:
+        df = ak.stock_info_a_code_name()
+        _code_name_cache = df
+    return _code_name_cache
+
+
+def _to_xq_symbol(stock_code):
+    """把 6 位股票代码转成雪球 symbol，如 600000 -> SH600000。"""
+    code = str(stock_code).zfill(6)
+    if code.startswith(("6", "9")):
+        return "SH" + code
+    if code.startswith(("0", "3")):
+        return "SZ" + code
+    return "BJ" + code
+
+
+def _parse_spot(df):
+    """把雪球 item/value 两列的行情表转成字典。"""
+    if df is None or df.empty:
+        return {}
+    return {str(row["item"]): row["value"] for _, row in df.iterrows()}
 
 
 def search_stock_code(stock_name):
     try:
-        spot_df = ak.stock_zh_a_spot_em()
-        matched = spot_df[spot_df["名称"] == stock_name]
-        if not matched.empty:
-            row = matched.iloc[0]
-            return {
-                "code": str(row["代码"]),
-                "name": str(row["名称"]),
-                "price": float(row["最新价"]) if pd.notna(row["最新价"]) else None,
-            }
+        info = _get_code_name_list()
+        target = _normalize_name(stock_name)
+        def _match(row):
+            if _normalize_name(row["name"]) == target:
+                return True
+            return False
+        matched = info[info.apply(_match, axis=1)]
+        if matched.empty:
+            return None
+        row = matched.iloc[0]
+        return {
+            "code": str(row["code"]),
+            "name": _normalize_name(row["name"]),
+            "price": None,
+        }
     except Exception as e:
         print(f"搜索股票代码失败: {e}")
     return None
@@ -20,16 +73,18 @@ def search_stock_code(stock_name):
 
 def get_stock_spot(stock_code):
     try:
-        spot_df = ak.stock_zh_a_spot_em()
-        matched = spot_df[spot_df["代码"] == stock_code]
-        if not matched.empty:
-            row = matched.iloc[0]
-            return {
-                "price": float(row["最新价"]) if pd.notna(row["最新价"]) else None,
-                "pe": float(row["市盈率-动态"]) if pd.notna(row["市盈率-动态"]) else None,
-                "pb": float(row["市净率"]) if pd.notna(row["市净率"]) else None,
-                "market_cap": float(row["总市值"]) if pd.notna(row["总市值"]) else None,
-            }
+        df = ak.stock_individual_spot_xq(
+            symbol=_to_xq_symbol(stock_code), token=XQ_A_TOKEN
+        )
+        d = _parse_spot(df)
+        if not d:
+            return {}
+        return {
+            "price": _to_float(d.get("现价")),
+            "pe": _to_float(d.get("市盈率(TTM)") or d.get("市盈率(动)")),
+            "pb": _to_float(d.get("市净率")),
+            "market_cap": _to_float(d.get("资产净值/总市值") or d.get("流通值")),
+        }
     except Exception as e:
         print(f"获取行情数据失败: {e}")
     return {}
@@ -37,20 +92,38 @@ def get_stock_spot(stock_code):
 
 def get_stock_industry(stock_code):
     try:
-        industry_df = ak.stock_board_industry_name_em()
-        spot_df = ak.stock_zh_a_spot_em()
-        spot_row = spot_df[spot_df["代码"] == stock_code]
-        if spot_row.empty:
+        df = ak.stock_individual_basic_info_xq(
+            symbol=_to_xq_symbol(stock_code), token=XQ_A_TOKEN
+        )
+        if df is None or df.empty:
             return None
-        stock_name = spot_row.iloc[0]["名称"]
-        for _, industry_row in industry_df.iterrows():
-            board_name = industry_row["板块名称"]
+        m = {str(row["item"]): row["value"] for _, row in df.iterrows()}
+        industry = m.get("affiliate_industry")
+        if isinstance(industry, dict):
+            name = industry.get("ind_name")
+            return name if name else None
+        if isinstance(industry, str):
             try:
-                cons = ak.stock_board_industry_cons_em(symbol=board_name)
-                if stock_name in cons["名称"].values:
-                    return board_name
+                parsed = ast.literal_eval(industry)
+                if isinstance(parsed, dict):
+                    return parsed.get("ind_name")
             except Exception:
-                continue
+                pass
+        return None
     except Exception as e:
         print(f"获取行业数据失败: {e}")
     return None
+
+
+def _to_float(val):
+    if val is None:
+        return None
+    try:
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip().replace(",", "").replace("%", "")
+        if s in ("", "-", "--", "nan"):
+            return None
+        return float(s)
+    except Exception:
+        return None
